@@ -175,9 +175,9 @@ class SpinChain(ModelProcessor):
         All parameters will be multiplied by 2*pi for simplicity
         """
         sx_para = 2 * np.pi * self.to_array(sx, self.N)
-        self._params["sx"] = sx_para
+        self.params["sx"] = sx_para
         sz_para = 2 * np.pi * self.to_array(sz, self.N)
-        self._params["sz"] = sz_para
+        self.params["sz"] = sz_para
 
     @property
     def sx_ops(self):
@@ -230,7 +230,7 @@ class SpinChain(ModelProcessor):
         """
         gates = self.optimize_circuit(qc).gates
         compiler = compiler_kind(
-            self.N, self._params, setup=setup,
+            self.N, self.params, setup=setup,
             global_phase=0., pulse_dict=deepcopy(self.pulse_dict))
         tlist, self.coeffs, self.global_phase = compiler.compile(gates, schedule_mode=schedule_mode)
         self.set_all_tlist(tlist)
@@ -446,9 +446,6 @@ class SpinChain(ModelProcessor):
 
         return qc_t
 
-    def eliminate_auxillary_modes(self, U):
-        return U
-
     def optimize_circuit(self, qc):
         """
         Take a quantum circuit/algorithm and convert it into the
@@ -523,7 +520,7 @@ class LinearSpinChain(SpinChain):
         # Doc same as in the parent class
         super(LinearSpinChain, self).set_up_params(sx, sz)
         sxsy_para = 2 * np.pi * self.to_array(sxsy, self.N-1)
-        self._params["sxsy"] = sxsy_para
+        self.params["sxsy"] = sxsy_para
 
     @property
     def sxsy_ops(self):
@@ -613,7 +610,7 @@ class CircularSpinChain(SpinChain):
         # Doc same as in the parent class
         super(CircularSpinChain, self).set_up_params(sx, sz)
         sxsy_para = 2 * np.pi * self.to_array(sxsy, self.N)
-        self._params["sxsy"] = sxsy_para
+        self.params["sxsy"] = sxsy_para
 
     @property
     def sxsy_ops(self):
