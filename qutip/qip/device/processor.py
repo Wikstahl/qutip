@@ -140,7 +140,16 @@ class Processor(object):
             self.dims = [2] * N
         else:
             self.dims = dims
+        self.pulse_mode = "discrete"
         self.spline_kind = spline_kind
+    
+    @property
+    def num_qubits(self):
+        return self.N
+
+    @num_qubits.setter
+    def get_num_qubits(self, num_qubits):
+        self.N = num_qubits
 
     def add_drift(self, qobj, targets, cyclic_permutation=False):
         """
@@ -220,6 +229,23 @@ class Processor(object):
         else:
             self.pulses.append(
                 Pulse(qobj, targets, spline_kind=self.spline_kind, label=label))
+    
+    def find_pulse(self, pulse_name):
+        if isinstance(pulse_name, str):
+            try:
+                return self.pulses[self.pulse_dict[pulse_name]]
+            except (AttributeError, KeyError):
+                raise KeyError(
+                    "Pulse name {} undefined. "
+                    "Please define it in the attribute "
+                    "`pulse_dict`.".format(pulse_name))
+        elif isinstance(pulse_name, int):
+            return self.pulses[pulse_name]
+        else:
+            raise TypeError(
+                "pulse_name is either a string or an integer, not "
+                "{}".format(type(pulse_name))
+                )
 
     @property
     def ctrls(self):
@@ -249,7 +275,28 @@ class Processor(object):
         for i, coeff in enumerate(coeffs_list):
             self.pulses[i].coeff = coeff
 
-    def get_full_tlist(self):
+    @property
+    def pulse_mode(self):
+        if self.spline_kind == "step_func":
+            return "discrete"
+        elif self.spline_kind == "cubic":
+            return "continuous"
+
+    @pulse_mode.setter
+    def pulse_mode(self, mode):
+        if mode == "discrete":
+            spline_kind = "step_func"
+        elif mode == "continuous":
+            spline_kind = "cubic"
+        else:
+            raise ValueError(
+                "Pulse mode must be either discrete or continuous.")
+
+        self.spline_kind = spline_kind
+        for pulse in self.pulses:
+            pulse.spline_kind = spline_kind
+
+    def get_full_tlist(self, tol=1.0e-10):
         """
         Return the full tlist of the ideal pulses.
         If different pulses have different time steps,
@@ -260,11 +307,14 @@ class Processor(object):
         full_tlist: array-like 1d
             The full time sequence for the ideal evolution.
         """
-        all_tlists = [pulse.tlist
+        full_tlist = [pulse.tlist
                       for pulse in self.pulses if pulse.tlist is not None]
-        if not all_tlists:
+        if not full_tlist:
             return None
-        return np.unique(np.sort(np.hstack(all_tlists)))
+        full_tlist = np.unique(np.sort(np.hstack(full_tlist)))
+        diff = np.append(True, np.diff(full_tlist))
+        full_tlist = full_tlist[diff > tol]
+        return full_tlist
 
     def get_full_coeffs(self, full_tlist=None):
         """
@@ -288,15 +338,19 @@ class Processor(object):
             full_tlist = self.get_full_tlist()
         coeffs_list = []
         for pulse in self.pulses:
+            if pulse.tlist is None and pulse.coeff is None:
+                coeffs_list.append(np.zeros(len(full_tlist)))
+                continue
             if not isinstance(pulse.coeff, (bool, np.ndarray)):
                 raise ValueError(
                     "get_full_coeffs only works for "
                     "NumPy array or bool coeff.")
             if isinstance(pulse.coeff, bool):
                 if pulse.coeff:
-                    coeffs_list.append(np.ones(full_tlist))
+                    coeffs_list.append(np.ones(len(full_tlist)))
                 else:
-                    coeffs_list.append(np.zeros(full_tlist))
+                    coeffs_list.append(np.zeros(len(full_tlist)))
+                continue
             if self.spline_kind == "step_func":
                 arg = {"_step_func_coeff": True}
                 coeffs_list.append(
@@ -318,8 +372,12 @@ class Processor(object):
             A list of time at which the time-dependent coefficients are
             applied. See :class:`qutip.qip.Pulse` for detailed information`
         """
-        for pulse in self.pulses:
-            pulse.tlist = tlist
+        if isinstance(tlist, list) and len(tlist) == len(self.pulses):
+            for i, pulse in enumerate(self.pulses):
+                pulse.tlist = tlist[i]
+        else:
+            for pulse in self.pulses:
+                pulse.tlist = tlist
 
     def add_pulse(self, pulse):
         """
@@ -734,7 +792,9 @@ class Processor(object):
             label_list.append(pulse.label)
         return [label_list]
 
-    def plot_pulses(self, title=None, figsize=(12, 6), dpi=None):
+    def plot_pulses(
+        self, title=None, figsize=(12, 6), dpi=None,
+        show_axis=False, rescale_pulse_coeffs=True):
         """
         Plot the ideal pulse coefficients.
 
@@ -771,32 +831,39 @@ class Processor(object):
         grids.update(wspace=0., hspace=0.)
 
         tlist = np.linspace(0., self.get_full_tlist()[-1], 1000)
+        dt = tlist[1] - tlist[0]
         coeffs = self.get_full_coeffs(tlist)
-        # make sure coeffs start with zero, for ax.fill
-        tlist = np.hstack(([-1.e-20], tlist))
-        coeffs = np.hstack((np.array([[0.]] * len(self.pulses)), coeffs))
+        # make sure coeffs start and end with zero, for ax.fill
+        tlist = np.hstack(([-dt*1.e-20], tlist, [tlist[-1] + dt*1.e-20]))
+        coeffs = np.hstack((np.array([[0.]] * len(self.pulses)), coeffs, np.array([[0.]] * len(self.pulses))))
 
         pulse_ind = 0
+        axis = []
         for i, label_group in enumerate(self.get_operators_labels()):
-            for label in label_group:
+            for j, label in enumerate(label_group):
                 grid = grids[pulse_ind]
                 ax = plt.subplot(grid)
+                axis.append(ax)
                 ax.fill(tlist, coeffs[pulse_ind], color_list[i], alpha=0.7)
                 ax.plot(tlist, coeffs[pulse_ind], color_list[i])
-                ymax = max(np.abs(coeffs[pulse_ind])) * 1.1
+                if rescale_pulse_coeffs:
+                    ymax = np.max(np.abs(coeffs[pulse_ind])) * 1.1
+                else:
+                    ymax = np.max(np.abs(coeffs)) * 1.1
                 if ymax != 0.:
                     ax.set_ylim((-ymax, ymax))
 
                 # disable frame and ticks
-                ax.set_xticks([])
+                if not show_axis:
+                    ax.set_xticks([])
+                    ax.spines['bottom'].set_visible(False)
                 ax.spines['top'].set_visible(False)
                 ax.spines['right'].set_visible(False)
-                ax.spines['bottom'].set_visible(False)
                 ax.spines['left'].set_visible(False)
                 ax.set_yticks([])
                 ax.set_ylabel(label,  rotation=0)
                 pulse_ind += 1
-        if title is not None:
-            ax.set_title(title)
+                if i == 0 and j==0 and title is not None:
+                    ax.set_title(title)
         fig.tight_layout()
-        return fig, ax
+        return fig, axis

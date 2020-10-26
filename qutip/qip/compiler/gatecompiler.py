@@ -31,6 +31,9 @@
 #    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ###############################################################################
 import numpy as np
+from .instruction import Instruction
+from .scheduler import Scheduler
+from ..circuit import QubitCircuit, Gate
 
 
 __all__ = ['GateCompiler']
@@ -51,7 +54,7 @@ class GateCompiler(object):
         such as laser frequency, detuning etc.
 
     num_ops: int
-        Number of control Hamiltonians in the processor.
+        Dictionary of pulse indices.
 
     Attributes
     ----------
@@ -62,29 +65,41 @@ class GateCompiler(object):
         A Python dictionary contains the name and the value of the parameters,
         such as laser frequency, detuning etc.
 
-    num_ops: int
-        Number of control Hamiltonians in the processor.
+    pulse_dict: int
+        Dictionary of pulse indices.
 
-    gate_decomps: dict
+    gate_compiler: dict
         The Python dictionary in the form of {gate_name: decompose_function}.
         It saves the decomposition scheme for each gate.
     """
-    def __init__(self, N, params, num_ops):
-        self.gate_decomps = {}
+    def __init__(self, N, params, pulse_dict):
+        self.gate_compiler = {}
         self.N = N
         self.params = params
-        self.num_ops = num_ops
+        self.pulse_dict = pulse_dict
+        self.gate_compiler = {"GLOBALPHASE": self.globalphase_compiler}
+        self.args = {}
 
-    def decompose(self, gates):
+    def globalphase_compiler(self, gate, args):
         """
-        Decompose the the elementary gates
+        Compiler for the GLOBALPHASE gate
+        """
+        pass
+
+    def compile(self, circuit, schedule_mode=None):
+        """
+        Compile the the elementary gates
         into control pulse sequence.
 
         Parameters
         ----------
-        gates: list
+        circuit: :class:`QubitCircuit` or list of :class:`gate`
             A list of elementary gates that can be implemented in this
-            model. The gate names have to be in `gate_decomps`.
+            model. The gate names have to be in `gate_compiler`.
+        
+        schedule_mode: str
+            "ASAP" for "as soon as possible" or
+            "ALAP" for "as late as possible"
 
         Returns
         -------
@@ -95,23 +110,137 @@ class GateCompiler(object):
             A 2d NumPy array of the shape ``(len(ctrls), len(tlist))``. Each
             row corresponds to the control pulse sequence for
             one Hamiltonian.
-
-        global_phase: bool
-            Recorded change of global phase.
         """
-        # TODO further improvement can be made here,
-        # e.g. merge single qubit rotation gate, combine XX gates etc.
-        self.dt_list = []
-        self.coeff_list = []
+        if isinstance(circuit, QubitCircuit):
+            gates = circuit.gates
+        else:
+            gates = circuit
+        num_ops = len(self.pulse_dict)
+        instruction_list = []
         for gate in gates:
-            if gate.name not in self.gate_decomps:
+            if gate.name not in self.gate_compiler:
                 raise ValueError("Unsupported gate %s" % gate.name)
-            self.gate_decomps[gate.name](gate)
-        coeffs = np.vstack(self.coeff_list).T
+            compilered_gate = self.gate_compiler[gate.name](gate, self.args)
+            if compilered_gate is None:
+                continue  # neglecting global phase gate
+            instruction_list += compilered_gate
+        if not instruction_list:
+            return None, None
 
-        tlist = np.empty(len(self.dt_list))
-        t = 0
-        for i in range(len(self.dt_list)):
-            t += self.dt_list[i]
-            tlist[i] = t
-        return np.hstack([[0], tlist]), coeffs
+        # check continuous or discrete pulse
+        if np.isscalar(instruction_list[0].tlist):
+            spline_kind = "step_func"
+        elif (len(instruction_list[0].tlist) - 1 == \
+                len(instruction_list[0].pulse_info[0][1])):
+            spline_kind = "step_func"
+        elif (len(instruction_list[0].tlist) == \
+                len(instruction_list[0].pulse_info[0][1])):
+            spline_kind = "cubic"
+        else:
+            raise ValueError(
+                "The shape of the compiled pulse is not correct.")
+
+        # scheduling
+        if schedule_mode:
+            scheduler = Scheduler(schedule_mode)
+            scheduled_start_time = scheduler.schedule(instruction_list)
+            time_ordered_pos = np.argsort(scheduled_start_time)
+        else:  # no scheduling
+            time_ordered_pos = list(range(0, len(instruction_list)))
+            scheduled_start_time = [0.]
+            for instruction in instruction_list:
+                scheduled_start_time.append(instruction.duration + scheduled_start_time[-1])
+            scheduled_start_time = scheduled_start_time[:-1]
+
+        # compile
+        pulse_instructions = [[] for tmp in range(num_ops)]
+        for ind in time_ordered_pos:
+            instruction = instruction_list[ind]
+            start_time = scheduled_start_time[ind]
+            for pulse_name, coeff in instruction.pulse_info:
+                pulse_ind = self.pulse_dict[pulse_name]
+                pulse_instructions[pulse_ind].append(
+                    (start_time, instruction.tlist, coeff))
+
+        compiled_tlist = [[[0.]] for tmp in range(num_ops)]
+        compiled_coeffs = [[] for tmp in range(num_ops)]        
+        for pulse_ind in range(num_ops):
+            for start_time, tlist, coeff in pulse_instructions[pulse_ind]:
+                if spline_kind == "step_func":
+                    if np.isscalar(tlist):
+                        step_size = tlist
+                        temp_tlist = np.array([tlist])
+                        coeff = np.array([coeff])
+                    else:
+                        step_size = tlist[1] - tlist[0]
+                        temp_tlist = np.asarray(tlist)[1:]
+                        coeff = np.asarray(coeff)
+                    if np.abs(start_time - compiled_tlist[pulse_ind][-1][-1]) > step_size * 1.0e-6:
+                        compiled_tlist[pulse_ind].append([start_time])
+                        compiled_coeffs[pulse_ind].append([0.])
+                    compiled_tlist[pulse_ind].append(temp_tlist + start_time)
+                    compiled_coeffs[pulse_ind].append(coeff)
+                else:
+                    step_size = tlist[1] - tlist[0]
+                    if compiled_coeffs[pulse_ind]:  # not first pulse
+                        temp_tlist = np.asarray(tlist)[1:]
+                        coeff = np.asarray(coeff)[1:]
+                    else:  #  first pulse
+                        temp_tlist = np.asarray(tlist)[1:]
+                        coeff = np.asarray(coeff)
+                    if np.abs(start_time - compiled_tlist[pulse_ind][-1][-1]) > step_size * 1.0e-6:
+                        empty_tlist = np.arange(compiled_tlist[pulse_ind][-1][-1] + step_size, start_time, step_size)
+                        compiled_tlist[pulse_ind].append(empty_tlist)
+                        compiled_coeffs[pulse_ind].append(np.zeros(len(empty_tlist)))
+                    compiled_tlist[pulse_ind].append(temp_tlist + start_time)
+                    compiled_coeffs[pulse_ind].append(coeff)
+
+        for i in range(num_ops):
+            if not compiled_coeffs[i]:
+                compiled_tlist[i] = None
+                compiled_coeffs[i] = None
+            else:
+                compiled_tlist[i] = np.concatenate(compiled_tlist[i])
+                compiled_coeffs[i] = np.concatenate(compiled_coeffs[i])
+                #  remove the leading 0
+                # if spline_kind == "cubic":
+                #     compiled_tlist[i] = compiled_tlist[i][1:]
+
+
+        # tlist = [[[0.]] for tmp in range(num_ops)]
+        # coeffs = [[] for tmp in range(num_ops)]
+        # for ind in time_ordered_pos:
+        #     instruction = instruction_list[ind]
+        #     start_time = scheduled_start_time[ind]
+        #     for pulse_name, coeff in instruction.pulse_info:
+        #         pulse_ind = self.pulse_dict[pulse_name]
+        #         if np.isscalar(instruction.tlist):
+        #             step_size = instruction.tlist
+        #             temp_tlist = np.array([instruction.tlist])
+        #             coeff = np.array([coeff])
+        #         else:
+        #             step_size = instruction.tlist[1] - instruction.tlist[0]
+        #             if coeffs[pulse_ind]:  # not the first pulse
+        #                 temp_tlist = instruction.tlist[1:]
+        #                 if spline_kind == "cubic":
+        #                     coeff = coeff[1:]
+        #             else:
+        #                 temp_tlist = instruction.tlist
+        #         if np.abs(start_time - tlist[pulse_ind][-1][-1]) > step_size * 1.0e-6:
+        #             tlist[pulse_ind].append([start_time])
+        #             coeffs[pulse_ind].append([0.])
+        #         tlist[pulse_ind].append(temp_tlist + start_time)
+        #         coeffs[pulse_ind].append(coeff)
+
+        # for i in range(num_ops):
+        #     if not coeffs[i]:
+        #         tlist[i] = None
+        #         coeffs[i] = None
+        #     else:
+        #         tlist[i] = np.concatenate(tlist[i])
+        #         coeffs[i] = np.concatenate(coeffs[i])
+        #         #  remove the leading 0
+        #         if spline_kind == "cubic":
+        #             tlist[i] = tlist[i][1:]
+
+        return compiled_tlist, compiled_coeffs

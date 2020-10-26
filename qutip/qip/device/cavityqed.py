@@ -31,6 +31,7 @@
 #    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ###############################################################################
 import warnings
+from copy import deepcopy
 
 import numpy as np
 
@@ -140,7 +141,7 @@ class DispersiveCavityQED(ModelProcessor):
         self.correct_global_phase = correct_global_phase
         self.spline_kind = "step_func"
         self.num_levels = num_levels
-        self._params = {}
+        self.params = {}
         self.set_up_params(
             N=N, num_levels=num_levels, deltamax=deltamax,
             epsmax=epsmax, w0=w0, wq=wq, eps=eps,
@@ -158,13 +159,19 @@ class DispersiveCavityQED(ModelProcessor):
         N: int
             The number of qubits in the system.
         """
+        self.pulse_dict = {}
+        index = 0
         # single qubit terms
         for m in range(N):
             self.pulses.append(
                 Pulse(sigmax(), [m+1], spline_kind=self.spline_kind))
+            self.pulse_dict["sx" + str(m)] = index
+            index += 1
         for m in range(N):
             self.pulses.append(
                 Pulse(sigmaz(), [m+1], spline_kind=self.spline_kind))
+            self.pulse_dict["sz" + str(m)] = index
+            index += 1
         # coupling terms
         a = tensor(
             [destroy(self.num_levels)] +
@@ -176,7 +183,9 @@ class DispersiveCavityQED(ModelProcessor):
             self.pulses.append(
                 Pulse(a.dag() * sm + a * sm.dag(),
                       list(range(N+1)), spline_kind=self.spline_kind))
-
+            self.pulse_dict["g" + str(n)] = index
+            index += 1
+    
     def set_up_params(
             self, N, num_levels, deltamax,
             epsmax, w0, wq, eps, delta, g):
@@ -217,17 +226,17 @@ class DispersiveCavityQED(ModelProcessor):
         All parameters will be multiplied by 2*pi for simplicity
         """
         sx_para = 2 * np.pi * self.to_array(deltamax, N)
-        self._params["sx"] = sx_para
+        self.params["sx"] = sx_para
         sz_para = 2 * np.pi * self.to_array(epsmax, N)
-        self._params["sz"] = sz_para
+        self.params["sz"] = sz_para
         w0 = 2 * np.pi * w0
-        self._params["w0"] = w0
+        self.params["w0"] = w0
         eps = 2 * np.pi * self.to_array(eps, N)
-        self._params["eps"] = eps
+        self.params["eps"] = eps
         delta = 2 * np.pi * self.to_array(delta, N)
-        self._params["delta"] = delta
+        self.params["delta"] = delta
         g = 2 * np.pi * self.to_array(g, N)
-        self._params["g"] = g
+        self.params["g"] = g
 
         # computed
         self.wq = np.sqrt(eps**2 + delta**2)
@@ -306,7 +315,8 @@ class DispersiveCavityQED(ModelProcessor):
             [identity(2) for n in range(self.N)])
         return psi_proj.dag() * U * psi_proj
 
-    def load_circuit(self, qc):
+    def load_circuit(
+            self, qc, schedule_mode="ASAP", compiler=None):
         """
         Decompose a :class:`qutip.QubitCircuit` in to the control
         amplitude generating the corresponding evolution.
@@ -327,9 +337,12 @@ class DispersiveCavityQED(ModelProcessor):
             one Hamiltonian.
         """
         gates = self.optimize_circuit(qc).gates
-        compiler = CavityQEDCompiler(
-            self.N, self._params,
-            global_phase=0., num_ops=len(self.ctrls))
-        tlist, self.coeffs, self.global_phase = compiler.decompose(gates)
+        if compiler is None:
+            compiler = CavityQEDCompiler(
+                self.N, self.params,
+                global_phase=0., pulse_dict=deepcopy(self.pulse_dict))
+        tlist, self.coeffs = compiler.compile(
+            gates, schedule_mode=schedule_mode)
+        self.global_phase = compiler.global_phase
         self.set_all_tlist(tlist)
         return tlist, self.coeffs

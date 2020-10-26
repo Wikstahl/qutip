@@ -31,6 +31,7 @@
 #    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ###############################################################################
 import warnings
+from copy import deepcopy
 
 import numpy as np
 
@@ -40,7 +41,6 @@ from qutip.qip.circuit import QubitCircuit
 from qutip.qip.device.processor import Processor
 from qutip.qip.device.modelprocessor import ModelProcessor
 from qutip.qip.pulse import Pulse
-from qutip.qip.compiler.gatecompiler import GateCompiler
 from qutip.qip.compiler.spinchaincompiler import SpinChainCompiler
 
 
@@ -135,19 +135,27 @@ class SpinChain(ModelProcessor):
         N: int
             The number of qubits in the system.
         """
+        self.pulse_dict = {}
+        index = 0
         # sx_ops
         for m in range(N):
             self.pulses.append(
                 Pulse(sigmax(), m, spline_kind=self.spline_kind))
+            self.pulse_dict["sx" + str(m)] = index
+            index += 1
         # sz_ops
         for m in range(N):
             self.pulses.append(
                 Pulse(sigmaz(), m, spline_kind=self.spline_kind))
+            self.pulse_dict["sz" + str(m)] = index
+            index += 1
         # sxsy_ops
         operator = tensor([sigmax(), sigmax()]) + tensor([sigmay(), sigmay()])
         for n in range(N - 1):
             self.pulses.append(
                 Pulse(operator, [n, n+1], spline_kind=self.spline_kind))
+            self.pulse_dict["g" + str(n)] = index
+            index += 1
 
     def set_up_params(self, sx, sz):
         """
@@ -167,9 +175,9 @@ class SpinChain(ModelProcessor):
         All parameters will be multiplied by 2*pi for simplicity
         """
         sx_para = 2 * np.pi * self.to_array(sx, self.N)
-        self._params["sx"] = sx_para
+        self.params["sx"] = sx_para
         sz_para = 2 * np.pi * self.to_array(sz, self.N)
-        self._params["sz"] = sz_para
+        self.params["sz"] = sz_para
 
     @property
     def sx_ops(self):
@@ -195,7 +203,8 @@ class SpinChain(ModelProcessor):
     def sxsy_u(self):
         return self.coeffs[2*self.N:]
 
-    def load_circuit(self, qc, setup):
+    def load_circuit(
+            self, qc, setup, schedule_mode="ASAP", compiler=None):
         """
         Decompose a :class:`qutip.QubitCircuit` in to the control
         amplitude generating the corresponding evolution.
@@ -206,7 +215,7 @@ class SpinChain(ModelProcessor):
             Takes the quantum circuit to be implemented.
 
         setup: string
-            "linear" or "circular" for two sub-calsses.
+            "linear" or "circular" for two sub-classes.
 
         Returns
         -------
@@ -219,11 +228,13 @@ class SpinChain(ModelProcessor):
             one Hamiltonian.
         """
         gates = self.optimize_circuit(qc).gates
-
-        compiler = SpinChainCompiler(
-            self.N, self._params, setup=setup,
-            global_phase=0., num_ops=len(self.ctrls))
-        tlist, self.coeffs, self.global_phase = compiler.decompose(gates)
+        if compiler is None:
+            compiler = SpinChainCompiler(
+                self.N, self.params, setup=setup,
+                global_phase=0., pulse_dict=deepcopy(self.pulse_dict))
+        tlist, self.coeffs = compiler.compile(
+            gates, schedule_mode=schedule_mode)
+        self.global_phase = compiler.global_phase
         self.set_all_tlist(tlist)
         return tlist, self.coeffs
 
@@ -437,9 +448,6 @@ class SpinChain(ModelProcessor):
 
         return qc_t
 
-    def eliminate_auxillary_modes(self, U):
-        return U
-
     def optimize_circuit(self, qc):
         """
         Take a quantum circuit/algorithm and convert it into the
@@ -514,7 +522,7 @@ class LinearSpinChain(SpinChain):
         # Doc same as in the parent class
         super(LinearSpinChain, self).set_up_params(sx, sz)
         sxsy_para = 2 * np.pi * self.to_array(sxsy, self.N-1)
-        self._params["sxsy"] = sxsy_para
+        self.params["sxsy"] = sxsy_para
 
     @property
     def sxsy_ops(self):
@@ -524,8 +532,9 @@ class LinearSpinChain(SpinChain):
     def sxsy_u(self):
         return self.coeffs[2*self.N: 3*self.N-1]
 
-    def load_circuit(self, qc):
-        return super(LinearSpinChain, self).load_circuit(qc, "linear")
+    def load_circuit(
+            self, qc, schedule_mode="ASAP", compiler=None):
+        return super(LinearSpinChain, self).load_circuit(qc, "linear", schedule_mode=schedule_mode, compiler=compiler)
 
     def get_operators_labels(self):
         """
@@ -596,12 +605,13 @@ class CircularSpinChain(SpinChain):
         operator = tensor([sigmax(), sigmax()]) + tensor([sigmay(), sigmay()])
         self.pulses.append(
             Pulse(operator, [N-1, 0], spline_kind=self.spline_kind))
+        self.pulse_dict["g" + str(N-1)] = len(self.pulses) - 1
 
     def set_up_params(self, sx, sz, sxsy):
         # Doc same as in the parent class
         super(CircularSpinChain, self).set_up_params(sx, sz)
         sxsy_para = 2 * np.pi * self.to_array(sxsy, self.N)
-        self._params["sxsy"] = sxsy_para
+        self.params["sxsy"] = sxsy_para
 
     @property
     def sxsy_ops(self):
@@ -611,8 +621,9 @@ class CircularSpinChain(SpinChain):
     def sxsy_u(self):
         return self.coeffs[2*self.N: 3*self.N]
 
-    def load_circuit(self, qc):
-        return super(CircularSpinChain, self).load_circuit(qc, "circular")
+    def load_circuit(
+            self, qc, schedule_mode="ASAP", compiler=None):
+        return super(CircularSpinChain, self).load_circuit(qc, "circular", schedule_mode=schedule_mode, compiler=compiler)
 
     def get_operators_labels(self):
         """
